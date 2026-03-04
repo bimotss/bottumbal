@@ -53,7 +53,6 @@ function serialToDate(serial) {
 }
 
 function parseTanggalToDayjs(value) {
-  // value bisa number (serial) atau string
   if (typeof value === "number" && Number.isFinite(value)) {
     return dayjs(serialToDate(value)).tz(TZ);
   }
@@ -61,7 +60,6 @@ function parseTanggalToDayjs(value) {
   const s = String(value || "").trim();
   if (!s) return null;
 
-  // format umum yang sering keluar dari Sheets
   const formats = [
     "YYYY-MM-DD HH:mm:ss",
     "YYYY-MM-DD H:mm:ss",
@@ -79,7 +77,6 @@ function parseTanggalToDayjs(value) {
     if (d.isValid()) return d;
   }
 
-  // fallback parse biasa
   const fallback = dayjs(s);
   if (fallback.isValid()) return fallback.tz(TZ);
 
@@ -98,7 +95,7 @@ function tanggalDisplay(value) {
 }
 
 function aggregateByCategory(rows) {
-  const map = new Map(); // kategori -> total
+  const map = new Map();
   for (const r of rows) {
     const key = (r.kategori || "-").trim() || "-";
     map.set(key, (map.get(key) || 0) + (r.nominal || 0));
@@ -130,9 +127,9 @@ function buildSeparateCategorySummary(inRows, outRows) {
   };
 }
 
-// Telegram limit 4096 chars, chunk biar aman
+// telegram max 4096 chars, chunk biar aman
 async function replyChunked(ctx, text) {
-  const MAX = 3800; // buffer
+  const MAX = 3800;
   if (text.length <= MAX) return ctx.reply(text);
 
   let i = 0;
@@ -149,24 +146,41 @@ async function replyChunked(ctx, text) {
   }
 }
 
+function getIdentity(ctx) {
+  const userId = String(ctx.from?.id ?? "");
+  const chatId = String(ctx.chat?.id ?? "");
+  return { userId, chatId };
+}
+
+function filterByUser(rows, userId) {
+  // pakai userId saja supaya konsisten (chatId bisa berubah kalau user pindah group/dll)
+  return rows.filter((r) => String(r.userId ?? "") === String(userId));
+}
+
+function filterByMonth(rows, ym) {
+  return rows.filter((x) => monthKeyFromTanggal(x.tanggal) === ym);
+}
+
 // ================= Sheets Ops =================
 
-async function appendRow(sheetName, { tanggal, kategori, nominal, keterangan }) {
+// PERUBAHAN #1: append nulis sampai kolom F (A:F)
+async function appendRow(sheetName, { tanggal, kategori, nominal, keterangan, userId, chatId }) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!A:D`,
+    range: `${sheetName}!A:F`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
-      values: [[tanggal, kategori, nominal, keterangan]],
+      values: [[tanggal, kategori, nominal, keterangan, userId, chatId]],
     },
   });
 }
 
+// PERUBAHAN #2: getRows baca A2:F
 async function getRows(sheetName) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!A2:D`,
+    range: `${sheetName}!A2:F`,
     valueRenderOption: "UNFORMATTED_VALUE",
     dateTimeRenderOption: "SERIAL_NUMBER",
   });
@@ -174,23 +188,26 @@ async function getRows(sheetName) {
   const values = res.data.values || [];
 
   return values.map((r) => ({
-    tanggal: r[0], // number serial atau string
+    tanggal: r[0],
     kategori: r[1] ?? "",
     nominal:
       typeof r[2] === "number"
         ? r[2]
         : Number(String(r[2] ?? "0").replace(/[^\d-]/g, "")) || 0,
     keterangan: r[3] ?? "",
+    userId: r[4] ?? "",
+    chatId: r[5] ?? "",
   }));
 }
 
-function filterByMonth(rows, ym) {
-  return rows.filter((x) => monthKeyFromTanggal(x.tanggal) === ym);
-}
-
 async function showDetailsMonth(ctx, sheetName, ym) {
+  const { userId } = getIdentity(ctx);
+
   const all = await getRows(sheetName);
-  const rows = filterByMonth(all, ym);
+
+  // PERUBAHAN #3: filter per user dulu baru per bulan
+  const mine = filterByUser(all, userId);
+  const rows = filterByMonth(mine, ym);
 
   if (rows.length === 0) {
     return ctx.reply(`Tidak ada data ${sheetName.toUpperCase()} untuk ${ym}.`);
@@ -266,7 +283,10 @@ async function handleInOut(ctx, sheetName) {
     if (nominal === null) return ctx.reply("Nominal tidak valid.");
 
     const tanggal = dayjs().tz(TZ).format("YYYY-MM-DD HH:mm:ss"); // WIB
-    await appendRow(sheetName, { tanggal, kategori, nominal, keterangan });
+
+    const { userId, chatId } = getIdentity(ctx);
+
+    await appendRow(sheetName, { tanggal, kategori, nominal, keterangan, userId, chatId });
 
     ctx.reply(`✅ ${sheetName.toUpperCase()} masuk: ${kategori} | ${money(nominal)}`);
   } catch (err) {
@@ -287,9 +307,17 @@ bot.command("report", async (ctx) => {
       return ctx.reply("Format: /report YYYY-MM (contoh: /report 2026-03)");
     }
 
+    const { userId } = getIdentity(ctx);
+
     const [inAll, outAll] = await Promise.all([getRows("in"), getRows("out")]);
-    const inRows = filterByMonth(inAll, ym);
-    const outRows = filterByMonth(outAll, ym);
+
+    // filter per user dulu
+    const inMine = filterByUser(inAll, userId);
+    const outMine = filterByUser(outAll, userId);
+
+    // lalu filter per bulan
+    const inRows = filterByMonth(inMine, ym);
+    const outRows = filterByMonth(outMine, ym);
 
     const totalIn = inRows.reduce((a, b) => a + (b.nominal || 0), 0);
     const totalOut = outRows.reduce((a, b) => a + (b.nominal || 0), 0);
