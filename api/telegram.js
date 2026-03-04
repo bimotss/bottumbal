@@ -41,6 +41,10 @@ function parseNominal(nominalRaw) {
   return nominal;
 }
 
+function isYearMonth(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}$/.test(s);
+}
+
 // Google Sheets serial date (days since 1899-12-30)
 function serialToDate(serial) {
   const ms = Math.round(serial * 86400000);
@@ -57,7 +61,7 @@ function parseTanggalToDayjs(value) {
   const s = String(value || "").trim();
   if (!s) return null;
 
-  // Coba beberapa format umum
+  // format umum yang sering keluar dari Sheets
   const formats = [
     "YYYY-MM-DD HH:mm:ss",
     "YYYY-MM-DD H:mm:ss",
@@ -75,7 +79,7 @@ function parseTanggalToDayjs(value) {
     if (d.isValid()) return d;
   }
 
-  // Fallback: coba parse biasa
+  // fallback parse biasa
   const fallback = dayjs(s);
   if (fallback.isValid()) return fallback.tz(TZ);
 
@@ -86,6 +90,11 @@ function monthKeyFromTanggal(value) {
   const d = parseTanggalToDayjs(value);
   if (!d) return null;
   return d.format("YYYY-MM");
+}
+
+function tanggalDisplay(value) {
+  const d = parseTanggalToDayjs(value);
+  return d ? d.format("YYYY-MM-DD HH:mm:ss") : String(value ?? "-");
 }
 
 function aggregateByCategory(rows) {
@@ -105,6 +114,41 @@ function biggestCategory(map) {
   return best;
 }
 
+function mapToSortedList(map) {
+  const list = [];
+  for (const [cat, total] of map.entries()) list.push({ cat, total });
+  list.sort((a, b) => b.total - a.total);
+  return list;
+}
+
+function buildSeparateCategorySummary(inRows, outRows) {
+  const inMap = aggregateByCategory(inRows);
+  const outMap = aggregateByCategory(outRows);
+  return {
+    inList: mapToSortedList(inMap),
+    outList: mapToSortedList(outMap),
+  };
+}
+
+// Telegram limit 4096 chars, chunk biar aman
+async function replyChunked(ctx, text) {
+  const MAX = 3800; // buffer
+  if (text.length <= MAX) return ctx.reply(text);
+
+  let i = 0;
+  while (i < text.length) {
+    const chunk = text.slice(i, i + MAX);
+    const cut = chunk.lastIndexOf("\n");
+    if (cut > 500 && i + MAX < text.length) {
+      await ctx.reply(chunk.slice(0, cut));
+      i += cut + 1;
+    } else {
+      await ctx.reply(chunk);
+      i += MAX;
+    }
+  }
+}
+
 // ================= Sheets Ops =================
 
 async function appendRow(sheetName, { tanggal, kategori, nominal, keterangan }) {
@@ -120,7 +164,6 @@ async function appendRow(sheetName, { tanggal, kategori, nominal, keterangan }) 
 }
 
 async function getRows(sheetName) {
-  // UNFORMATTED_VALUE + SERIAL_NUMBER bikin tanggal balik jadi angka serial (stabil untuk filter)
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: `${sheetName}!A2:D`,
@@ -131,15 +174,45 @@ async function getRows(sheetName) {
   const values = res.data.values || [];
 
   return values.map((r) => ({
-    tanggal: r[0], // bisa number serial atau string
+    tanggal: r[0], // number serial atau string
     kategori: r[1] ?? "",
-    nominal: typeof r[2] === "number" ? r[2] : Number(String(r[2] ?? "0").replace(/[^\d-]/g, "")) || 0,
+    nominal:
+      typeof r[2] === "number"
+        ? r[2]
+        : Number(String(r[2] ?? "0").replace(/[^\d-]/g, "")) || 0,
     keterangan: r[3] ?? "",
   }));
 }
 
 function filterByMonth(rows, ym) {
   return rows.filter((x) => monthKeyFromTanggal(x.tanggal) === ym);
+}
+
+async function showDetailsMonth(ctx, sheetName, ym) {
+  const all = await getRows(sheetName);
+  const rows = filterByMonth(all, ym);
+
+  if (rows.length === 0) {
+    return ctx.reply(`Tidak ada data ${sheetName.toUpperCase()} untuk ${ym}.`);
+  }
+
+  rows.sort((a, b) => {
+    const da = parseTanggalToDayjs(a.tanggal);
+    const db = parseTanggalToDayjs(b.tanggal);
+    if (!da || !db) return 0;
+    return da.valueOf() - db.valueOf();
+  });
+
+  const total = rows.reduce((s, r) => s + (r.nominal || 0), 0);
+
+  const lines = rows.map((r, idx) => {
+    return `${idx + 1}. ${tanggalDisplay(r.tanggal)} | ${r.kategori || "-"} | ${money(
+      r.nominal || 0
+    )} | ${r.keterangan || "-"}`;
+  });
+
+  const header = `📋 Detail ${sheetName.toUpperCase()} ${ym}\nTotal: ${money(total)} (${rows.length} data)\n`;
+  await replyChunked(ctx, header + "\n" + lines.join("\n"));
 }
 
 // ================= Bot =================
@@ -151,10 +224,16 @@ bot.start((ctx) => {
     [
       "Bot aktif.",
       "",
-      "Format:",
+      "Input:",
       "/in <kategori> <nominal> <keterangan...>",
       "/out <kategori> <nominal> <keterangan...>",
-      "/report YYYY-MM (contoh: /report 2026-03)",
+      "",
+      "Detail bulanan:",
+      "/in YYYY-MM",
+      "/out YYYY-MM",
+      "",
+      "Report:",
+      "/report YYYY-MM",
     ].join("\n")
   );
 });
@@ -162,25 +241,37 @@ bot.start((ctx) => {
 async function handleInOut(ctx, sheetName) {
   try {
     const parts = (ctx.message?.text || "").split(" ").filter(Boolean);
+
+    // Mode detail: /in 2026-03 atau /out 2026-03
+    const maybeYm = parts[1];
+    if (isYearMonth(maybeYm) && parts.length === 2) {
+      return showDetailsMonth(ctx, sheetName, maybeYm);
+    }
+
+    // Mode input: /in kategori nominal keterangan...
     const kategori = parts[1];
     const nominalRaw = parts[2];
     const keterangan = parts.slice(3).join(" ") || "-";
 
     if (!kategori || !nominalRaw) {
-      return ctx.reply(`Format: /${sheetName} <kategori> <nominal> <keterangan...>`);
+      return ctx.reply(
+        [
+          `Format input: /${sheetName} <kategori> <nominal> <keterangan...>`,
+          `Format detail: /${sheetName} YYYY-MM`,
+        ].join("\n")
+      );
     }
 
     const nominal = parseNominal(nominalRaw);
     if (nominal === null) return ctx.reply("Nominal tidak valid.");
 
     const tanggal = dayjs().tz(TZ).format("YYYY-MM-DD HH:mm:ss"); // WIB
-
     await appendRow(sheetName, { tanggal, kategori, nominal, keterangan });
 
     ctx.reply(`✅ ${sheetName.toUpperCase()} masuk: ${kategori} | ${money(nominal)}`);
   } catch (err) {
     console.error(err?.response?.data || err.message);
-    ctx.reply("❌ Gagal nulis ke sheet (cek logs Vercel).");
+    ctx.reply("❌ Gagal proses (cek logs).");
   }
 }
 
@@ -192,7 +283,7 @@ bot.command("report", async (ctx) => {
     const parts = (ctx.message?.text || "").split(" ").filter(Boolean);
     const ym = parts[1];
 
-    if (!ym || !/^\d{4}-\d{2}$/.test(ym)) {
+    if (!isYearMonth(ym)) {
       return ctx.reply("Format: /report YYYY-MM (contoh: /report 2026-03)");
     }
 
@@ -209,21 +300,48 @@ bot.command("report", async (ctx) => {
 
     const sign = net >= 0 ? "+" : "-";
 
-    ctx.reply(
-      [
-        `📊 Report ${ym}`,
-        "",
-        `Masuk: ${money(totalIn)} (${inRows.length} data)`,
-        `Keluar: ${money(totalOut)} (${outRows.length} data)`,
-        `Net: ${sign}${money(Math.abs(net))}`,
-        "",
-        `Kategori pemasukan terbesar: ${biggestIn ? `${biggestIn.kategori} | ${money(biggestIn.total)}` : "-"}`,
-        `Kategori pengeluaran terbesar: ${biggestOut ? `${biggestOut.kategori} | ${money(biggestOut.total)}` : "-"}`,
-      ].join("\n")
-    );
+    // Summary dipisah
+    const { inList, outList } = buildSeparateCategorySummary(inRows, outRows);
+    const maxCats = 20;
+
+    const inLines = inList.slice(0, maxCats).map((x) => `- ${x.cat}: ${money(x.total)}`);
+    const outLines = outList.slice(0, maxCats).map((x) => `- ${x.cat}: ${money(x.total)}`);
+
+    const inSection = [
+      "",
+      `📌 Summary IN (${inList.length} kategori):`,
+      ...(inLines.length ? inLines : ["-"]),
+      inList.length > maxCats ? `…(${inList.length - maxCats} kategori lainnya disembunyikan)` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const outSection = [
+      "",
+      `📌 Summary OUT (${outList.length} kategori):`,
+      ...(outLines.length ? outLines : ["-"]),
+      outList.length > maxCats ? `…(${outList.length - maxCats} kategori lainnya disembunyikan)` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const text = [
+      `📊 Report ${ym}`,
+      "",
+      `Masuk: ${money(totalIn)} (${inRows.length} data)`,
+      `Keluar: ${money(totalOut)} (${outRows.length} data)`,
+      `Net: ${sign}${money(Math.abs(net))}`,
+      "",
+      `Kategori pemasukan terbesar: ${biggestIn ? `${biggestIn.kategori} | ${money(biggestIn.total)}` : "-"}`,
+      `Kategori pengeluaran terbesar: ${biggestOut ? `${biggestOut.kategori} | ${money(biggestOut.total)}` : "-"}`,
+      inSection,
+      outSection,
+    ].join("\n");
+
+    await replyChunked(ctx, text);
   } catch (err) {
     console.error(err?.response?.data || err.message);
-    ctx.reply("❌ Gagal ambil report (cek logs Vercel).");
+    ctx.reply("❌ Gagal ambil report (cek logs).");
   }
 });
 
